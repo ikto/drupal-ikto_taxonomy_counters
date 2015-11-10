@@ -1,0 +1,7 @@
+name = IKTO Taxonomy Counters
+description = Automatically calculate counts of nodes and subterms
+core = 7.x
+package = Taxonomy
+
+dependencies[] = taxonomy
+dependencies[] = ikto_taxonomy_parents

@@ -1,0 +1,391 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function ikto_taxonomy_counters_menu() {
+  $items['admin/config/system/ikto-taxonomy-counters'] = array(
+    'title'             => 'IKTO Taxonomy Counters',
+    'description'       => 'Adjust taxonomy counters settings.',
+    'file'              => 'ikto_taxonomy_counters.admin.inc',
+    'page callback'     => 'drupal_get_form',
+    'page arguments'    => array('ikto_taxonomy_counters_settings_form'),
+    'access arguments'  => array('administer site configuration'),
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function ikto_taxonomy_counters_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function ikto_taxonomy_counters_ctools_plugin_directory($owner, $plugin_type) {
+  if ($owner == 'ctools' && $plugin_type == 'contexts') {
+    return 'plugins/' . $plugin_type;
+  }
+  elseif ($owner == 'ctools' && $plugin_type == 'relationships') {
+    return 'plugins/' . $plugin_type;
+  }
+}
+
+/**
+ * Implements hook_taxonomy_vocabulary_delete().
+ */
+function ikto_taxonomy_counters_taxonomy_vocabulary_delete($vocabulary) {
+  variable_del('ikto_taxonomy_counters_processing_voc_manip_' . $vocabulary->machine_name);
+  variable_del('ikto_taxonomy_counters_processing_voc_cron_' . $vocabulary->machine_name);
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ */
+function ikto_taxonomy_counters_taxonomy_term_delete($term) {
+  db_delete('ikto_taxonomy_counters')
+    ->condition('tid', $term->tid)
+    ->execute();
+
+  $parent = ikto_taxonomy_parents_get_parents($term->tid);
+  ikto_taxonomy_counters_mark_needs_update($parent);
+
+  ikto_taxonomy_counters_process_vocabulary(taxonomy_vocabulary_load($term->vid), 'manip');
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ */
+function ikto_taxonomy_counters_taxonomy_term_insert($term) {
+  db_insert('ikto_taxonomy_counters')
+    ->fields(array(
+      'tid' => $term->tid,
+    ))
+    ->execute();
+
+  if (isset($term->parent)) {
+    $parent = $term->parent;
+    if (!is_array($parent)) {
+      $parent = array($parent);
+    }
+
+    ikto_taxonomy_counters_mark_needs_update($parent);
+  }
+
+  ikto_taxonomy_counters_process_vocabulary(taxonomy_vocabulary_load($term->vid), 'manip');
+}
+
+/**
+ * Implements hook_taxonomy_term_update().
+ */
+function ikto_taxonomy_counters_taxonomy_term_update($term) {
+  $terms = array();
+
+  if (isset($term->parent)) {
+    if (is_array($term->parent)) {
+      $terms = array_merge($terms, $term->parent);
+    }
+    else {
+      $terms = array_merge($terms, array($term->parent));
+    }
+  }
+
+  if (is_object($term->original)) {
+    $terms = array_merge($terms, ikto_taxonomy_parents_get_parents($term->original->tid));
+  }
+
+  $terms = array_unique($terms);
+
+  ikto_taxonomy_counters_mark_needs_update($terms);
+  ikto_taxonomy_counters_process_vocabulary(taxonomy_vocabulary_load($term->vid), 'manip');
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function ikto_taxonomy_counters_node_insert($node) {
+  $tids = ikto_taxonomy_counters_get_tids_affected_by_node($node);
+  ikto_taxonomy_counters_mark_needs_update($tids);
+
+  $vids = ikto_taxonomy_counters_get_vids_by_tids($tids);
+  $vocabularies = taxonomy_vocabulary_load_multiple($vids);
+  foreach ($vocabularies as $vocabulary) {
+    ikto_taxonomy_counters_process_vocabulary($vocabulary, 'manip');
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function ikto_taxonomy_counters_node_update($node) {
+  $tids = ikto_taxonomy_counters_get_tids_affected_by_node($node);
+  ikto_taxonomy_counters_mark_needs_update($tids);
+
+  $vids = ikto_taxonomy_counters_get_vids_by_tids($tids);
+  $vocabularies = taxonomy_vocabulary_load_multiple($vids);
+  foreach ($vocabularies as $vocabulary) {
+    ikto_taxonomy_counters_process_vocabulary($vocabulary, 'manip');
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function ikto_taxonomy_counters_node_delete($node) {
+  $tids = ikto_taxonomy_counters_get_tids_affected_by_node($node);
+  ikto_taxonomy_counters_mark_needs_update($tids);
+
+  $vids = ikto_taxonomy_counters_get_vids_by_tids($tids);
+  $vocabularies = taxonomy_vocabulary_load_multiple($vids);
+  foreach ($vocabularies as $vocabulary) {
+    ikto_taxonomy_counters_process_vocabulary($vocabulary, 'manip');
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function ikto_taxonomy_counters_module_implements_alter(&$implementations, $hook) {
+  if (($hook != 'node_insert') && ($hook != 'node_update') && ($hook != 'node_delete')) {
+    return;
+  }
+
+  $modules = array_keys($implementations);
+  $taxonomy_key = array_search('taxonomy', $modules);
+  $ikto_taxonomy_counters_key = array_search('ikto_taxonomy_counters', $modules);
+
+  if ($taxonomy_key < $ikto_taxonomy_counters_key) {
+    return;
+  }
+
+  $ikto_taxonomy_counters_implementation = $implementations['ikto_taxonomy_counters'];
+  unset($implementations['ikto_taxonomy_counters']);
+
+  $other_implementations = array();
+  $taxonomy_seen = FALSE;
+  foreach ($implementations as $module => $info) {
+    if (!$taxonomy_seen && ($module == 'taxonomy')) {
+      $taxonomy_seen = TRUE;
+      continue;
+    }
+
+    if ($taxonomy_seen) {
+      $other_implementations[$module] = $info;
+      unset($implementations[$module]);
+    }
+  }
+
+  $implementations['ikto_taxonomy_counters'] = $ikto_taxonomy_counters_implementation;
+  foreach ($other_implementations as $module => $info) {
+    $implementations[$module] = $info;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ikto_taxonomy_counters_cron() {
+  /**
+   * @var DrupalQueueInterface $queue
+   */
+  $queue = DrupalQueue::get('ikto_taxonomy_counters');
+
+  if (!$queue->numberOfItems()) {
+    $vocabularies = taxonomy_get_vocabularies();
+
+    foreach ($vocabularies as $vocabulary) {
+      $queue->createItem(array('vid' => $vocabulary->vid));
+    }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function ikto_taxonomy_counters_cron_queue_info() {
+  $queues['ikto_taxonomy_counters'] = array(
+    'worker callback' => 'ikto_taxonomy_counters_worker_callback',
+  );
+
+  return $queues;
+}
+
+function ikto_taxonomy_counters_get_vids_by_tids($tids) {
+  $vids = array();
+
+  if (empty($tids)) {
+    return $vids;
+  }
+
+  $query = db_select('taxonomy_term_data', 'd');
+  $query->distinct();
+  $query->addField('d', 'vid');
+  $query->condition('d.tid', $tids, 'IN');
+  $result = $query->execute();
+
+  while ($row = $result->fetchAssoc()) {
+    $vids[] = $row['vid'];
+  }
+
+  return $vids;
+}
+
+function ikto_taxonomy_counters_get_tids_affected_by_node($node) {
+  $tid_all = array();
+
+  foreach (field_info_instances('node', $node->type) as $instance) {
+    $field_name = $instance['field_name'];
+    $field = field_info_field($field_name);
+    if ($field['module'] == 'taxonomy' && $field['storage']['type'] == 'field_sql_storage') {
+      if (isset($node->{$field_name})) {
+        $items = $node->{$field_name};
+        foreach ($items as $items_langcode) {
+          foreach ($items_langcode as $item) {
+            $tid_all[$item['tid']] = $item['tid'];
+          }
+        }
+      }
+
+      if (isset($node->original->{$field_name})) {
+        $items = $node->original->{$field_name};
+        foreach ($items as $items_langcode) {
+          foreach ($items_langcode as $item) {
+            $tid_all[$item['tid']] = $item['tid'];
+          }
+        }
+      }
+
+    }
+  }
+
+  return array_values($tid_all);
+}
+
+function ikto_taxonomy_counters_update_counters_for_tid($tid) {
+  // Count nodes under the term (only published)
+  $query = db_select('taxonomy_index', 'i');
+  $query->addExpression('COUNT(nid)', 'quantity');
+  $query->condition('tid', $tid);
+  $nodes = $query->execute();
+
+  $count_nodes = 0;
+  if ($row = $nodes->fetchAssoc()) {
+    $count_nodes = $row['quantity'];
+  }
+
+  // Count terms under the term
+  $query = db_select('taxonomy_term_hierarchy', 'h');
+  $query->innerJoin('taxonomy_term_data', 'd', 'h.tid = d.tid');
+  $query->fields('h', array('tid'));
+  $query->condition('h.parent', $tid);
+  $terms = $query->execute();
+
+  $subtids = array();
+  while ($row = $terms->fetchAssoc()) {
+    $subtids[] = $row['tid'];
+  }
+  $count_terms = count($subtids);
+
+  // Initialize 'all' counters
+  $count_terms_all = $count_terms;
+  $count_nodes_all = $count_nodes;
+
+  if (!empty($subtids)) {
+    // Include subterms counters in 'all'
+    $query = db_select('ikto_taxonomy_counters', 'c');
+    $query->addExpression('SUM(c.count_terms_all)', 'count_terms');
+    $query->addExpression('SUM(c.count_nodes_all)', 'count_nodes');
+    $query->condition('c.tid', $subtids, 'IN');
+    $subdata = $query->execute();
+
+    if ($row = $subdata->fetchAssoc()) {
+      $count_nodes_all += $row['count_nodes'];
+      $count_terms_all += $row['count_terms'];
+    }
+  }
+
+  // Update counters
+  db_update('ikto_taxonomy_counters')
+    ->fields(array(
+      'count_terms' => $count_terms,
+      'count_nodes' => $count_nodes,
+      'count_nodes_all' => $count_nodes_all,
+      'count_terms_all' => $count_terms_all,
+      'updated' => REQUEST_TIME,
+      'needs_update' => 0,
+    ))
+    ->condition('tid', $tid)
+    ->execute();
+
+  // Set parent term as need to be updated
+  $query = db_select('taxonomy_term_hierarchy', 'h');
+  $query->innerJoin('taxonomy_term_data', 'd', 'h.tid = d.tid');
+  $query->fields('h', array('parent'));
+  $query->condition('h.tid', $tid);
+  $terms = $query->execute();
+
+  $parent_tids = array();
+  while ($row = $terms->fetchAssoc()) {
+    $parent_tids[] = $row['parent'];
+  }
+
+  ikto_taxonomy_counters_mark_needs_update($parent_tids);
+}
+
+function ikto_taxonomy_counters_mark_needs_update($tids) {
+  if (!is_array($tids)) {
+    $tids = array($tids);
+  }
+
+  if (!empty($tids)) {
+    db_update('ikto_taxonomy_counters')
+      ->fields(array('needs_update' => 1))
+      ->condition('tid', $tids, 'IN')
+      ->execute();
+  }
+}
+
+function ikto_taxonomy_counters_process_vocabulary($vocabulary, $invocation_type) {
+  if ($invocation_type == 'manip') {
+    $steps = variable_get('ikto_taxonomy_counters_processing_voc_manip_' . $vocabulary->machine_name, 0);
+  }
+  elseif ($invocation_type == 'cron') {
+    $steps = variable_get('ikto_taxonomy_counters_processing_voc_cron_' . $vocabulary->machine_name, 0);
+  }
+  else {
+    watchdog('ikto_taxonomy_counters', 'Unknown invocation type: @type', array('@type' => $invocation_type), WATCHDOG_ERROR);
+    return;
+  }
+
+  while ($steps != 0) {
+    $steps--;
+
+    $query = db_select('ikto_taxonomy_counters', 'c');
+    $query->innerJoin('taxonomy_term_data', 'd', 'c.tid = d.tid');
+    $query->addField('c', 'tid');
+    $query->condition('c.needs_update', 1);
+    $query->condition('d.vid', $vocabulary->vid);
+    $result = $query->execute();
+
+    $rows = 0;
+    while ($row = $result->fetchAssoc()) {
+      ikto_taxonomy_counters_update_counters_for_tid($row['tid']);
+      $rows++;
+    }
+
+    if (!$rows) {
+      break;
+    }
+  }
+}
+
+function ikto_taxonomy_counters_worker_callback($params) {
+  $vocabulary = taxonomy_vocabulary_load($params['vid']);
+  ikto_taxonomy_counters_process_vocabulary($vocabulary, 'cron');
+}

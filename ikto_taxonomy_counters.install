@@ -1,0 +1,87 @@
+<?php
+
+/**
+ * Implements hook_schema().
+ */
+function ikto_taxonomy_counters_schema() {
+  $schema['ikto_taxonomy_counters'] = array(
+    'description' => 'Counters info for existing taxonomy terms',
+    'fields' => array(
+      'tid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'description' => 'Primary Key: Unique term ID.',
+      ),
+      'count_terms' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Counter: count of child terms',
+      ),
+      'count_nodes' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Counter: count of child nodes',
+      ),
+      'count_terms_all' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Counter: count of child terms (including all nested)',
+      ),
+      'count_nodes_all' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Counter: count of child nodes (including all nested)',
+      ),
+      'updated' => array(
+        'description' => 'The Unix timestamp when counters were updated.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'needs_update' => array(
+        'description' => 'Boolean indicating whether counters need to be updated ASAP.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 1,
+      ),
+    ),
+    'primary key' => array('tid'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implements hook_install().
+ */
+function ikto_taxonomy_counters_install() {
+  $terms = db_select('taxonomy_term_data', 'd')
+    ->fields('d', array('tid'))
+    ->orderBy('d.tid')
+    ->execute();
+
+  while ($row = $terms->fetchAssoc()) {
+    db_insert('ikto_taxonomy_counters')
+      ->fields(array(
+        'tid' => $row['tid'],
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function ikto_taxonomy_counters_uninstall() {
+  $vocabularies = taxonomy_get_vocabularies();
+
+  foreach ($vocabularies as $vocabulary) {
+    variable_del('ikto_taxonomy_counters_processing_voc_manip_' . $vocabulary->machine_name);
+    variable_del('ikto_taxonomy_counters_processing_voc_cron_' . $vocabulary->machine_name);
+  }
+}
